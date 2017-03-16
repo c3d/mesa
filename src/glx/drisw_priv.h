@@ -22,6 +22,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+#include <assert.h>
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <X11/extensions/XShm.h>
 
 struct drisw_display
 {
@@ -32,7 +37,6 @@ struct drisw_context
 {
    struct glx_context base;
    __DRIcontext *driContext;
-
 };
 
 struct drisw_screen
@@ -62,6 +66,7 @@ struct drisw_drawable
    __DRIdrawable *driDrawable;
    XVisualInfo *visinfo;
    XImage *ximage;
+   XShmSegmentInfo shminfo;
 };
 
 _X_HIDDEN int

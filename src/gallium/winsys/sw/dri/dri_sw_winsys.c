@@ -26,16 +26,19 @@
  *
  **************************************************************************/
 
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
 #include "pipe/p_compiler.h"
 #include "pipe/p_format.h"
 #include "util/u_inlines.h"
 #include "util/u_format.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/u_debug.h"
 
 #include "state_tracker/sw_winsys.h"
 #include "dri_sw_winsys.h"
-
 
 struct dri_sw_displaytarget
 {
@@ -44,6 +47,7 @@ struct dri_sw_displaytarget
    unsigned height;
    unsigned stride;
 
+   int shmid;
    unsigned map_flags;
    void *data;
    void *mapped;
@@ -79,6 +83,25 @@ dri_sw_is_displaytarget_format_supported( struct sw_winsys *ws,
    return TRUE;
 }
 
+static char *
+alloc_shm(struct dri_sw_displaytarget *dri_sw_dt, unsigned size)
+{
+   char *addr;
+
+   dri_sw_dt->shmid = shmget(IPC_PRIVATE, size, IPC_CREAT|0777);
+   if (dri_sw_dt->shmid < 0) {
+      return NULL;
+   }
+
+   addr = (char *) shmat(dri_sw_dt->shmid, 0, 0);
+   if (addr == (char *) -1) {
+      shmctl(dri_sw_dt->shmid, IPC_RMID, 0);
+      return NULL;
+   }
+
+   return addr;
+}
+
 static struct sw_displaytarget *
 dri_sw_displaytarget_create(struct sw_winsys *winsys,
                             unsigned tex_usage,
@@ -88,6 +111,7 @@ dri_sw_displaytarget_create(struct sw_winsys *winsys,
                             const void *front_private,
                             unsigned *stride)
 {
+   struct dri_sw_winsys *ws = dri_sw_winsys(winsys);
    struct dri_sw_displaytarget *dri_sw_dt;
    unsigned nblocksy, size, format_stride;
 
@@ -106,7 +130,13 @@ dri_sw_displaytarget_create(struct sw_winsys *winsys,
    nblocksy = util_format_get_nblocksy(format, height);
    size = dri_sw_dt->stride * nblocksy;
 
-   dri_sw_dt->data = align_malloc(size, alignment);
+   dri_sw_dt->shmid = -1;
+   if (ws->lf->put_image_shm)
+      dri_sw_dt->data = alloc_shm(dri_sw_dt, size);
+
+   if(!dri_sw_dt->data)
+      dri_sw_dt->data = align_malloc(size, alignment);
+
    if(!dri_sw_dt->data)
       goto no_data;
 
@@ -125,7 +155,12 @@ dri_sw_displaytarget_destroy(struct sw_winsys *ws,
 {
    struct dri_sw_displaytarget *dri_sw_dt = dri_sw_displaytarget(dt);
 
-   align_free(dri_sw_dt->data);
+   if (dri_sw_dt->shmid >= 0) {
+      shmdt(dri_sw_dt->data);
+      shmctl(dri_sw_dt->shmid, IPC_RMID, 0);
+   } else {
+      align_free(dri_sw_dt->data);
+   }
 
    FREE(dri_sw_dt);
 }
@@ -187,25 +222,33 @@ dri_sw_displaytarget_display(struct sw_winsys *ws,
    struct dri_sw_winsys *dri_sw_ws = dri_sw_winsys(ws);
    struct dri_sw_displaytarget *dri_sw_dt = dri_sw_displaytarget(dt);
    struct dri_drawable *dri_drawable = (struct dri_drawable *)context_private;
-   unsigned width, height;
+   unsigned width, height, x = 0, y = 0;
    unsigned blsize = util_format_get_blocksize(dri_sw_dt->format);
+   unsigned offset = 0;
+   void *data = dri_sw_dt->data;
 
    /* Set the width to 'stride / cpp'.
     *
     * PutImage correctly clips to the width of the dst drawable.
     */
-   width = dri_sw_dt->stride / blsize;
-
-   height = dri_sw_dt->height;
-
    if (box) {
-       void *data;
-       data = dri_sw_dt->data + (dri_sw_dt->stride * box->y) + box->x * blsize;
-       dri_sw_ws->lf->put_image2(dri_drawable, data,
-                                 box->x, box->y, box->width, box->height, dri_sw_dt->stride);
+      offset = (dri_sw_dt->stride * box->y) + box->x * blsize;
+      data += offset;
+      x = box->x;
+      y = box->y;
+      width = box->width;
+      height = box->height;
    } else {
-       dri_sw_ws->lf->put_image(dri_drawable, dri_sw_dt->data, width, height);
+      width = dri_sw_dt->stride / blsize;
+      height = dri_sw_dt->height;
    }
+
+   if (dri_sw_dt->shmid == -1)
+      dri_sw_ws->lf->put_image2(dri_drawable, data,
+                                x, y, width, height, dri_sw_dt->stride);
+   else
+      dri_sw_ws->lf->put_image_shm(dri_drawable, dri_sw_dt->shmid, dri_sw_dt->data, offset,
+                                   x, y, width, height, dri_sw_dt->stride);
 }
 
 static void
